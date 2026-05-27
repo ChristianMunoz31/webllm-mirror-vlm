@@ -1,0 +1,96 @@
+# Copy this file to a public GitHub repo at .github/workflows/mirror-hf.yml,
+# then go to Actions â†’ "Mirror HF model (Transformers.js)" â†’ Run workflow.
+# After it finishes (~5-8 minutes), paste this URL into the app's
+# Settings â†’ Transformers.js mirror:
+#
+#   https://raw.githubusercontent.com/<your-username>/<this-repo>/main/models
+#
+# Files will live at:
+#   https://raw.githubusercontent.com/<user>/<repo>/main/models/<ORG>/<NAME>/<file>
+#
+# Use this workflow for Transformers.js (HF ONNX) models. For MLC models
+# (WebLLM), use mirror-raw.yml or mirror-releases.yml instead â€” the layout
+# differs.
+
+name: Mirror HF model (Transformers.js)
+on:
+  workflow_dispatch:
+    inputs:
+      hf_model_id:
+        description: 'HF model id with org prefix (e.g. HuggingFaceTB/SmolVLM-256M-Instruct)'
+        required: true
+        default: 'HuggingFaceTB/SmolVLM-256M-Instruct'
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install git-lfs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-lfs
+          git lfs install
+
+      - name: Clone HF model
+        env:
+          HF_ID: ${{ github.event.inputs.hf_model_id }}
+        run: |
+          rm -rf model
+          git clone "https://huggingface.co/${HF_ID}" model
+          cd model && git lfs pull && cd ..
+          rm -rf model/.git
+          # Preserve the org/name path: Transformers.js URL builder will use
+          # the full model id as the directory segment.
+          mkdir -p "models/${HF_ID}"
+          # Move both top-level files and any subdirectories (e.g. onnx/)
+          shopt -s dotglob nullglob
+          mv model/* "models/${HF_ID}/" 2>/dev/null || true
+          rm -rf model
+
+      - name: Commit & push (batched)
+        env:
+          HF_ID: ${{ github.event.inputs.hf_model_id }}
+        run: |
+          git config user.name "mirror-bot"
+          git config user.email "actions@github.com"
+          # Find every file under the model dir so subdirectories (like onnx/)
+          # are included.
+          MODEL_DIR="models/${HF_ID}"
+          if [ ! -d "$MODEL_DIR" ]; then
+            echo "Model directory $MODEL_DIR not found"
+            exit 1
+          fi
+          mapfile -t files < <(find "$MODEL_DIR" -type f)
+          total=${#files[@]}
+          BATCH_SIZE=8
+          echo "Pushing $total files from $MODEL_DIR in batches of $BATCH_SIZE"
+          batch_num=0
+          for ((i=0; i<total; i+=BATCH_SIZE)); do
+            batch_num=$((batch_num+1))
+            batch=("${files[@]:i:BATCH_SIZE}")
+            for f in "${batch[@]}"; do
+              git add "$f"
+            done
+            if git diff --cached --quiet; then
+              echo "Batch $batch_num: nothing to commit, skipping"
+              continue
+            fi
+            git commit -m "Mirror ${HF_ID} (batch $batch_num)"
+            for attempt in 1 2 3; do
+              if git push; then
+                echo "Batch $batch_num pushed on attempt $attempt"
+                break
+              fi
+              if [ "$attempt" = "3" ]; then
+                echo "Batch $batch_num failed after 3 attempts"
+                exit 1
+              fi
+              echo "Batch $batch_num push attempt $attempt failed, sleeping 15s"
+              sleep 15
+            done
+          done
+          echo "All $batch_num batches pushed successfully"

@@ -50,11 +50,22 @@ jobs:
           shopt -s dotglob nullglob
           mv model/* "models/${HF_ID}/" 2>/dev/null || true
           rm -rf model
+          # CRITICAL: strip the HF repo's .gitattributes. It contains LFS rules
+          # like `*.onnx filter=lfs` which would make our `git add` replace
+          # binaries with pointer text. We want regular blobs.
+          rm -f "models/${HF_ID}/.gitattributes"
+          # Drop any file over 99 MB â€” raw.githubusercontent.com rejects
+          # blobs > 100 MB. The adapter loads only the smaller quantized
+          # variants anyway.
+          find "models/${HF_ID}" -type f -size +99M -print -delete
 
       - name: Commit & push (batched)
         env:
           HF_ID: ${{ github.event.inputs.hf_model_id }}
         run: |
+          # Defensive: uninstall LFS hooks for this checkout so even an
+          # inherited .gitattributes wouldn't trigger the LFS clean filter.
+          git lfs uninstall --local 2>/dev/null || true
           git config user.name "mirror-bot"
           git config user.email "actions@github.com"
           # Find every file under the model dir so subdirectories (like onnx/)

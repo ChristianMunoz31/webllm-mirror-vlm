@@ -64,58 +64,67 @@ jobs:
           # variants anyway.
           find "models/${HF_ID}" -type f -size +99M -print -delete
 
-      - name: Commit & push (batched)
+      - name: Upload via Contents API (bypass git LFS)
         env:
           HF_ID: ${{ github.event.inputs.hf_model_id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Defensive: uninstall LFS hooks AND nuke the global LFS filter so
-          # `git add` of .onnx files commits them as regular blobs (not LFS
-          # pointer text). `git lfs install` (run in the previous step) added
-          # the filter in the runner's global gitconfig; `--local` uninstall
-          # doesn't reach it. We unset it explicitly here.
-          git lfs uninstall --local 2>/dev/null || true
-          git config --global --unset-all filter.lfs.clean 2>/dev/null || true
-          git config --global --unset-all filter.lfs.smudge 2>/dev/null || true
-          git config --global --unset-all filter.lfs.process 2>/dev/null || true
-          git config --global --unset-all filter.lfs.required 2>/dev/null || true
-          # Sanity: confirm no LFS filter remains
-          echo "filter.lfs.clean: $(git config --get filter.lfs.clean || echo unset)"
-          git config user.name "mirror-bot"
-          git config user.email "actions@github.com"
-          # Find every file under the model dir so subdirectories (like onnx/)
-          # are included.
+          # We can't use `git add` / `git push` because the git LFS filter
+          # captures binary files even after we strip .gitattributes â€” the
+          # `git lfs install` hooks live somewhere we can't easily unset on the
+          # runner. The GitHub Contents API takes base64 content and commits
+          # regular blobs unconditionally, bypassing git LFS entirely.
           MODEL_DIR="models/${HF_ID}"
           if [ ! -d "$MODEL_DIR" ]; then
             echo "Model directory $MODEL_DIR not found"
             exit 1
           fi
-          mapfile -t files < <(find "$MODEL_DIR" -type f)
-          total=${#files[@]}
-          BATCH_SIZE=8
-          echo "Pushing $total files from $MODEL_DIR in batches of $BATCH_SIZE"
-          batch_num=0
-          for ((i=0; i<total; i+=BATCH_SIZE)); do
-            batch_num=$((batch_num+1))
-            batch=("${files[@]:i:BATCH_SIZE}")
-            for f in "${batch[@]}"; do
-              git add "$f"
-            done
-            if git diff --cached --quiet; then
-              echo "Batch $batch_num: nothing to commit, skipping"
-              continue
-            fi
-            git commit -m "Mirror ${HF_ID} (batch $batch_num)"
+          total=$(find "$MODEL_DIR" -type f ! -name '.gitattributes' | wc -l)
+          echo "Uploading $total files to ${GITHUB_REPOSITORY} via Contents API"
+          idx=0
+          find "$MODEL_DIR" -type f ! -name '.gitattributes' -print0 | while IFS= read -r -d '' f; do
+            idx=$((idx+1))
+            name=$(basename "$f")
+            sz=$(stat -c%s "$f")
+            sz_mb=$(awk "BEGIN{printf \"%.1f\", $sz/1024/1024}")
+            # Look up the existing sha if the file is already in main (so the
+            # PUT updates it instead of conflicting).
+            sha=$(gh api "repos/${GITHUB_REPOSITORY}/contents/${f}" --jq '.sha' 2>/dev/null || true)
             for attempt in 1 2 3; do
-              if git push; then
-                echo "Batch $batch_num pushed on attempt $attempt"
-                break
+              if [ -n "$sha" ]; then
+                args=(-X PUT "repos/${GITHUB_REPOSITORY}/contents/${f}"
+                      -f "message=Mirror ${HF_ID} (${idx}/${total}): ${name}"
+                      -F "content=@<(base64 -w0 \"$f\")"
+                      -f "sha=${sha}")
+              else
+                args=(-X PUT "repos/${GITHUB_REPOSITORY}/contents/${f}"
+                      -f "message=Mirror ${HF_ID} (${idx}/${total}): ${name}"
+                      -F "content=@<(base64 -w0 \"$f\")")
+              fi
+              # Use bash process substitution to feed base64 without huge inline arg
+              content=$(base64 -w0 "$f")
+              if [ -n "$sha" ]; then
+                if gh api -X PUT "repos/${GITHUB_REPOSITORY}/contents/${f}" \
+                    -f "message=Mirror ${HF_ID} (${idx}/${total}): ${name}" \
+                    -f "content=${content}" \
+                    -f "sha=${sha}" --silent; then
+                  echo "[$idx/$total] $name (${sz_mb}MB, updated)"
+                  break
+                fi
+              else
+                if gh api -X PUT "repos/${GITHUB_REPOSITORY}/contents/${f}" \
+                    -f "message=Mirror ${HF_ID} (${idx}/${total}): ${name}" \
+                    -f "content=${content}" --silent; then
+                  echo "[$idx/$total] $name (${sz_mb}MB, new)"
+                  break
+                fi
               fi
               if [ "$attempt" = "3" ]; then
-                echo "Batch $batch_num failed after 3 attempts"
+                echo "[$idx/$total] $name failed after 3 attempts"
                 exit 1
               fi
-              echo "Batch $batch_num push attempt $attempt failed, sleeping 15s"
-              sleep 15
+              echo "[$idx/$total] attempt $attempt failed, sleeping 10s"
+              sleep 10
             done
           done
-          echo "All $batch_num batches pushed successfully"
+          echo "Uploaded $total files via Contents API"

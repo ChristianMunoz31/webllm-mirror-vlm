@@ -68,9 +68,18 @@ jobs:
         env:
           HF_ID: ${{ github.event.inputs.hf_model_id }}
         run: |
-          # Defensive: uninstall LFS hooks for this checkout so even an
-          # inherited .gitattributes wouldn't trigger the LFS clean filter.
+          # Defensive: uninstall LFS hooks AND nuke the global LFS filter so
+          # `git add` of .onnx files commits them as regular blobs (not LFS
+          # pointer text). `git lfs install` (run in the previous step) added
+          # the filter in the runner's global gitconfig; `--local` uninstall
+          # doesn't reach it. We unset it explicitly here.
           git lfs uninstall --local 2>/dev/null || true
+          git config --global --unset-all filter.lfs.clean 2>/dev/null || true
+          git config --global --unset-all filter.lfs.smudge 2>/dev/null || true
+          git config --global --unset-all filter.lfs.process 2>/dev/null || true
+          git config --global --unset-all filter.lfs.required 2>/dev/null || true
+          # Sanity: confirm no LFS filter remains
+          echo "filter.lfs.clean: $(git config --get filter.lfs.clean || echo unset)"
           git config user.name "mirror-bot"
           git config user.email "actions@github.com"
           # Find every file under the model dir so subdirectories (like onnx/)

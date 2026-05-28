@@ -53,7 +53,12 @@ jobs:
           # CRITICAL: strip the HF repo's .gitattributes. It contains LFS rules
           # like `*.onnx filter=lfs` which would make our `git add` replace
           # binaries with pointer text. We want regular blobs.
+          # Use BOTH `rm` (working tree) and `git rm` (staging) so the deletion
+          # is recorded even if a previous broken run already committed the
+          # .gitattributes â€” without the `git rm`, the committed copy stays
+          # and its LFS rules continue to apply.
           rm -f "models/${HF_ID}/.gitattributes"
+          git rm -f --ignore-unmatch --cached "models/${HF_ID}/.gitattributes" || true
           # Drop any file over 99 MB â€” raw.githubusercontent.com rejects
           # blobs > 100 MB. The adapter loads only the smaller quantized
           # variants anyway.

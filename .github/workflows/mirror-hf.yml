@@ -81,63 +81,30 @@ jobs:
             echo "OK ${f} (${sz} bytes, ${sz_mb} MB)"
           done
 
-      - name: Upload via Contents API (bypass git LFS)
+      - name: Commit and push (regular blobs, no LFS)
         env:
           HF_ID: ${{ github.event.inputs.hf_model_id }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # We can't use `git add` / `git push` because the git LFS filter
-          # captures binary files even after we strip .gitattributes — the
-          # `git lfs install` hooks live somewhere we can't easily unset on the
-          # runner. The GitHub Contents API takes base64 content and commits
-          # regular blobs unconditionally, bypassing git LFS entirely.
-          MODEL_DIR="models/${HF_ID}"
-          if [ ! -d "$MODEL_DIR" ]; then
-            echo "Model directory $MODEL_DIR not found"
-            exit 1
+          # The Contents API rejects files above ~50 MB with HTTP 422
+          # ("Sorry, the file is too large to be processed") even though the
+          # documented per-file limit is 100 MB. git push handles up to 100 MB
+          # per blob without LFS. We can safely git push here because:
+          #   - we never ran `git lfs install` (no hooks installed)
+          #   - we never brought in HF's .gitattributes (downloaded files
+          #     individually via curl, not `git clone`)
+          #   - this mirror repo has no .gitattributes of its own
+          # So git's clean filter has no LFS rule to fire, and binaries
+          # commit as regular blobs served by raw.githubusercontent.com.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Defensive: belt-and-suspenders deletion of any .gitattributes.
+          rm -f .gitattributes "models/${HF_ID}/.gitattributes"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit — mirror already up to date"
+            exit 0
           fi
-          total=$(find "$MODEL_DIR" -type f ! -name '.gitattributes' | wc -l)
-          echo "Uploading $total files to ${GITHUB_REPOSITORY} via Contents API"
-          idx=0
-          find "$MODEL_DIR" -type f ! -name '.gitattributes' -print0 | while IFS= read -r -d '' f; do
-            idx=$((idx+1))
-            name=$(basename "$f")
-            sz=$(stat -c%s "$f")
-            sz_mb=$(awk "BEGIN{printf \"%.1f\", $sz/1024/1024}")
-            # Look up the existing sha if the file is already in main.
-            sha=$(gh api "repos/${GITHUB_REPOSITORY}/contents/${f}" --jq '.sha' 2>/dev/null || true)
-            # Build the JSON payload in temp files — base64 of large binaries
-            # exceeds ARG_MAX when passed as a command-line argument, so we
-            # use jq --rawfile to stream content from disk and pipe the
-            # payload to `gh api --input -`.
-            b64_file=$(mktemp)
-            payload_file=$(mktemp)
-            base64 -w0 "$f" > "$b64_file"
-            if [ -n "$sha" ]; then
-              jq -n --rawfile content "$b64_file" \
-                    --arg msg "Mirror ${HF_ID} (${idx}/${total}): ${name}" \
-                    --arg sha "$sha" \
-                    '{message: $msg, content: $content, sha: $sha}' > "$payload_file"
-            else
-              jq -n --rawfile content "$b64_file" \
-                    --arg msg "Mirror ${HF_ID} (${idx}/${total}): ${name}" \
-                    '{message: $msg, content: $content}' > "$payload_file"
-            fi
-            for attempt in 1 2 3; do
-              if gh api -X PUT "repos/${GITHUB_REPOSITORY}/contents/${f}" \
-                    --input "$payload_file" --silent; then
-                tag=$([ -n "$sha" ] && echo "updated" || echo "new")
-                echo "[$idx/$total] $name (${sz_mb}MB, $tag)"
-                break
-              fi
-              if [ "$attempt" = "3" ]; then
-                echo "[$idx/$total] $name failed after 3 attempts"
-                rm -f "$b64_file" "$payload_file"
-                exit 1
-              fi
-              echo "[$idx/$total] attempt $attempt failed, sleeping 10s"
-              sleep 10
-            done
-            rm -f "$b64_file" "$payload_file"
-          done
-          echo "Uploaded $total files via Contents API"
+          MODEL_DIR="models/${HF_ID}"
+          total=$(find "$MODEL_DIR" -type f | wc -l)
+          git commit -m "Mirror ${HF_ID} (${total} files)"
+          git push

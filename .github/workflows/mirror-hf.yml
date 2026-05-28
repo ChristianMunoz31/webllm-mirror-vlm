@@ -1,7 +1,7 @@
 # Copy this file to a public GitHub repo at .github/workflows/mirror-hf.yml,
-# then go to Actions â†’ "Mirror HF model (Transformers.js)" â†’ Run workflow.
+# then go to Actions → "Mirror HF model (Transformers.js)" → Run workflow.
 # After it finishes (~5-8 minutes), paste this URL into the app's
-# Settings â†’ Transformers.js mirror:
+# Settings → Transformers.js mirror:
 #
 #   https://raw.githubusercontent.com/<your-username>/<this-repo>/main/models
 #
@@ -9,7 +9,7 @@
 #   https://raw.githubusercontent.com/<user>/<repo>/main/models/<ORG>/<NAME>/<file>
 #
 # Use this workflow for Transformers.js (HF ONNX) models. For MLC models
-# (WebLLM), use mirror-raw.yml or mirror-releases.yml instead â€” the layout
+# (WebLLM), use mirror-raw.yml or mirror-releases.yml instead — the layout
 # differs.
 
 name: Mirror HF model (Transformers.js)
@@ -29,40 +29,57 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install git-lfs
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y git-lfs
-          git lfs install
-
-      - name: Clone HF model
+      - name: Download model files from HF (resolve URLs, no LFS)
         env:
           HF_ID: ${{ github.event.inputs.hf_model_id }}
         run: |
-          rm -rf model
-          git clone "https://huggingface.co/${HF_ID}" model
-          cd model && git lfs pull && cd ..
-          rm -rf model/.git
-          # Preserve the org/name path: Transformers.js URL builder will use
-          # the full model id as the directory segment.
-          mkdir -p "models/${HF_ID}"
-          # Move both top-level files and any subdirectories (e.g. onnx/)
-          shopt -s dotglob nullglob
-          mv model/* "models/${HF_ID}/" 2>/dev/null || true
-          rm -rf model
-          # CRITICAL: strip the HF repo's .gitattributes. It contains LFS rules
-          # like `*.onnx filter=lfs` which would make our `git add` replace
-          # binaries with pointer text. We want regular blobs.
-          # Use BOTH `rm` (working tree) and `git rm` (staging) so the deletion
-          # is recorded even if a previous broken run already committed the
-          # .gitattributes â€” without the `git rm`, the committed copy stays
-          # and its LFS rules continue to apply.
-          rm -f "models/${HF_ID}/.gitattributes"
-          git rm -f --ignore-unmatch --cached "models/${HF_ID}/.gitattributes" || true
-          # Drop any file over 99 MB â€” raw.githubusercontent.com rejects
-          # blobs > 100 MB. The adapter loads only the smaller quantized
-          # variants anyway.
-          find "models/${HF_ID}" -type f -size +99M -print -delete
+          # Bypass git+LFS entirely on the source side. HF has migrated many
+          # large blobs to Xet storage, where `git lfs pull` is a silent no-op
+          # — the working tree keeps the LFS pointer text. The HTTPS resolve
+          # endpoint serves actual file bytes regardless of storage backend.
+          MODEL_DIR="models/${HF_ID}"
+          mkdir -p "${MODEL_DIR}/onnx"
+          # Hardcoded to SmolVLM-256M-Instruct's file set. Matches the
+          # per-subgraph dtype map in src/services/transformersjs.js — when a
+          # new curated model is added there, update this list in lockstep.
+          # ONNX picks fit under raw.githubusercontent.com's 100 MB cap:
+          # embed_tokens_quantized (~27 MB), vision_encoder_q4 (~60 MB),
+          # decoder_model_merged_q4 (~82 MB).
+          FILES=(
+            "config.json"
+            "generation_config.json"
+            "preprocessor_config.json"
+            "processor_config.json"
+            "special_tokens_map.json"
+            "tokenizer.json"
+            "tokenizer_config.json"
+            "added_tokens.json"
+            "chat_template.json"
+            "vocab.json"
+            "merges.txt"
+            "onnx/embed_tokens_quantized.onnx"
+            "onnx/vision_encoder_q4.onnx"
+            "onnx/decoder_model_merged_q4.onnx"
+          )
+          for f in "${FILES[@]}"; do
+            url="https://huggingface.co/${HF_ID}/resolve/main/${f}"
+            out="${MODEL_DIR}/${f}"
+            mkdir -p "$(dirname "$out")"
+            # -L follows the CDN/Xet redirect; -f errors on 4xx/5xx so a
+            # missing file fails the run loudly instead of silently uploading
+            # an HTML error page.
+            curl -L -f -sS -o "$out" "$url"
+            sz=$(stat -c%s "$out")
+            # Sanity check: any real ONNX is >>1MB. A 130-byte file is an
+            # LFS pointer that snuck through — fail immediately.
+            if [[ "$f" == *.onnx ]] && (( sz < 1048576 )); then
+              echo "FAIL: $f is only ${sz} bytes — likely a pointer, not a binary"
+              head -c 200 "$out"
+              exit 1
+            fi
+            sz_mb=$(awk "BEGIN{printf \"%.2f\", ${sz}/1024/1024}")
+            echo "OK ${f} (${sz} bytes, ${sz_mb} MB)"
+          done
 
       - name: Upload via Contents API (bypass git LFS)
         env:
@@ -70,7 +87,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # We can't use `git add` / `git push` because the git LFS filter
-          # captures binary files even after we strip .gitattributes â€” the
+          # captures binary files even after we strip .gitattributes — the
           # `git lfs install` hooks live somewhere we can't easily unset on the
           # runner. The GitHub Contents API takes base64 content and commits
           # regular blobs unconditionally, bypassing git LFS entirely.
@@ -89,7 +106,7 @@ jobs:
             sz_mb=$(awk "BEGIN{printf \"%.1f\", $sz/1024/1024}")
             # Look up the existing sha if the file is already in main.
             sha=$(gh api "repos/${GITHUB_REPOSITORY}/contents/${f}" --jq '.sha' 2>/dev/null || true)
-            # Build the JSON payload in temp files â€” base64 of large binaries
+            # Build the JSON payload in temp files — base64 of large binaries
             # exceeds ARG_MAX when passed as a command-line argument, so we
             # use jq --rawfile to stream content from disk and pipe the
             # payload to `gh api --input -`.

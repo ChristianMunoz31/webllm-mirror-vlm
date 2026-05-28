@@ -87,44 +87,40 @@ jobs:
             name=$(basename "$f")
             sz=$(stat -c%s "$f")
             sz_mb=$(awk "BEGIN{printf \"%.1f\", $sz/1024/1024}")
-            # Look up the existing sha if the file is already in main (so the
-            # PUT updates it instead of conflicting).
+            # Look up the existing sha if the file is already in main.
             sha=$(gh api "repos/${GITHUB_REPOSITORY}/contents/${f}" --jq '.sha' 2>/dev/null || true)
+            # Build the JSON payload in temp files â€” base64 of large binaries
+            # exceeds ARG_MAX when passed as a command-line argument, so we
+            # use jq --rawfile to stream content from disk and pipe the
+            # payload to `gh api --input -`.
+            b64_file=$(mktemp)
+            payload_file=$(mktemp)
+            base64 -w0 "$f" > "$b64_file"
+            if [ -n "$sha" ]; then
+              jq -n --rawfile content "$b64_file" \
+                    --arg msg "Mirror ${HF_ID} (${idx}/${total}): ${name}" \
+                    --arg sha "$sha" \
+                    '{message: $msg, content: $content, sha: $sha}' > "$payload_file"
+            else
+              jq -n --rawfile content "$b64_file" \
+                    --arg msg "Mirror ${HF_ID} (${idx}/${total}): ${name}" \
+                    '{message: $msg, content: $content}' > "$payload_file"
+            fi
             for attempt in 1 2 3; do
-              if [ -n "$sha" ]; then
-                args=(-X PUT "repos/${GITHUB_REPOSITORY}/contents/${f}"
-                      -f "message=Mirror ${HF_ID} (${idx}/${total}): ${name}"
-                      -F "content=@<(base64 -w0 \"$f\")"
-                      -f "sha=${sha}")
-              else
-                args=(-X PUT "repos/${GITHUB_REPOSITORY}/contents/${f}"
-                      -f "message=Mirror ${HF_ID} (${idx}/${total}): ${name}"
-                      -F "content=@<(base64 -w0 \"$f\")")
-              fi
-              # Use bash process substitution to feed base64 without huge inline arg
-              content=$(base64 -w0 "$f")
-              if [ -n "$sha" ]; then
-                if gh api -X PUT "repos/${GITHUB_REPOSITORY}/contents/${f}" \
-                    -f "message=Mirror ${HF_ID} (${idx}/${total}): ${name}" \
-                    -f "content=${content}" \
-                    -f "sha=${sha}" --silent; then
-                  echo "[$idx/$total] $name (${sz_mb}MB, updated)"
-                  break
-                fi
-              else
-                if gh api -X PUT "repos/${GITHUB_REPOSITORY}/contents/${f}" \
-                    -f "message=Mirror ${HF_ID} (${idx}/${total}): ${name}" \
-                    -f "content=${content}" --silent; then
-                  echo "[$idx/$total] $name (${sz_mb}MB, new)"
-                  break
-                fi
+              if gh api -X PUT "repos/${GITHUB_REPOSITORY}/contents/${f}" \
+                    --input "$payload_file" --silent; then
+                tag=$([ -n "$sha" ] && echo "updated" || echo "new")
+                echo "[$idx/$total] $name (${sz_mb}MB, $tag)"
+                break
               fi
               if [ "$attempt" = "3" ]; then
                 echo "[$idx/$total] $name failed after 3 attempts"
+                rm -f "$b64_file" "$payload_file"
                 exit 1
               fi
               echo "[$idx/$total] attempt $attempt failed, sleeping 10s"
               sleep 10
             done
+            rm -f "$b64_file" "$payload_file"
           done
           echo "Uploaded $total files via Contents API"
